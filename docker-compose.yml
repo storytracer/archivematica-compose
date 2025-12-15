@@ -1,0 +1,224 @@
+# =============================================================================
+# Archivematica Docker Compose
+# =============================================================================
+# 
+# Exposed services:
+#   - archivematica-dashboard: port 8000
+#   - archivematica-storage-service: port 8001
+#
+# =============================================================================
+
+services:
+  # ===========================================================================
+  # MySQL Database
+  # ===========================================================================
+  mysql:
+    image: mysql:8.0
+    command: --default-authentication-plugin=mysql_native_password
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_USER: ${MYSQL_USER:-archivematica}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ===========================================================================
+  # Elasticsearch
+  # ===========================================================================
+  elasticsearch:
+    image: elasticsearch:6.8.23
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - cluster.name=archivematica
+      - "ES_JAVA_OPTS=-Xms${ES_HEAP_SIZE:-512m} -Xmx${ES_HEAP_SIZE:-512m}"
+      - xpack.security.enabled=false
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  # ===========================================================================
+  # Gearman Job Server
+  # ===========================================================================
+  gearmand:
+    image: artefactual/gearmand:latest
+    restart: unless-stopped
+
+  # ===========================================================================
+  # Redis
+  # ===========================================================================
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+
+  # ===========================================================================
+  # ClamAV Antivirus
+  # ===========================================================================
+  clamavd:
+    image: artefactual/clamav:latest
+    restart: unless-stopped
+    environment:
+      CLAMAV_MAX_FILE_SIZE: ${CLAMAV_MAX_FILE_SIZE:-2000M}
+      CLAMAV_MAX_SCAN_SIZE: ${CLAMAV_MAX_SCAN_SIZE:-2000M}
+      CLAMAV_MAX_STREAM_LENGTH: ${CLAMAV_MAX_STREAM_LENGTH:-2000M}
+    volumes:
+      - clamav_data:/var/lib/clamav
+      - archivematica_pipeline_data:/var/archivematica/sharedDirectory:ro
+
+  # ===========================================================================
+  # FITS (File Information Tool Set)
+  # ===========================================================================
+  fits:
+    image: artefactual/fits-ngserver:1.1.1
+    restart: unless-stopped
+
+  # ===========================================================================
+  # Archivematica MCP Server
+  # ===========================================================================
+  archivematica-mcp-server:
+    build:
+      context: "./submodules/archivematica/src"
+      dockerfile: "MCPServer.Dockerfile"
+    restart: unless-stopped
+    environment:
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY}
+      DJANGO_SETTINGS_MODULE: settings.common
+      ARCHIVEMATICA_MCPSERVER_CLIENT_USER: ${MYSQL_USER:-archivematica}
+      ARCHIVEMATICA_MCPSERVER_CLIENT_PASSWORD: ${MYSQL_PASSWORD}
+      ARCHIVEMATICA_MCPSERVER_CLIENT_HOST: mysql
+      ARCHIVEMATICA_MCPSERVER_CLIENT_DATABASE: MCP
+      ARCHIVEMATICA_MCPSERVER_MCPSERVER_MCPARCHIVEMATICASERVER: "gearmand:4730"
+      ARCHIVEMATICA_MCPSERVER_SEARCH_ENABLED: ${AM_SEARCH_ENABLED:-true}
+    volumes:
+      - archivematica_pipeline_data:/var/archivematica/sharedDirectory:rw
+    depends_on:
+      mysql:
+        condition: service_healthy
+      gearmand:
+        condition: service_started
+      elasticsearch:
+        condition: service_healthy
+
+  # ===========================================================================
+  # Archivematica MCP Client
+  # ===========================================================================
+  archivematica-mcp-client:
+    build:
+      context: "./submodules/archivematica/src"
+      dockerfile: "MCPClient.Dockerfile"
+    restart: unless-stopped
+    environment:
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY}
+      DJANGO_SETTINGS_MODULE: settings.common
+      NAILGUN_SERVER: fits
+      NAILGUN_PORT: "2113"
+      ARCHIVEMATICA_MCPCLIENT_CLIENT_USER: ${MYSQL_USER:-archivematica}
+      ARCHIVEMATICA_MCPCLIENT_CLIENT_PASSWORD: ${MYSQL_PASSWORD}
+      ARCHIVEMATICA_MCPCLIENT_CLIENT_HOST: mysql
+      ARCHIVEMATICA_MCPCLIENT_CLIENT_DATABASE: MCP
+      ARCHIVEMATICA_MCPCLIENT_MCPCLIENT_ELASTICSEARCHSERVER: "elasticsearch:9200"
+      ARCHIVEMATICA_MCPCLIENT_MCPCLIENT_MCPARCHIVEMATICASERVER: "gearmand:4730"
+      ARCHIVEMATICA_MCPCLIENT_MCPCLIENT_SEARCH_ENABLED: ${AM_SEARCH_ENABLED:-true}
+      ARCHIVEMATICA_MCPCLIENT_MCPCLIENT_CAPTURE_CLIENT_SCRIPT_OUTPUT: ${AM_CAPTURE_CLIENT_SCRIPT_OUTPUT:-true}
+      ARCHIVEMATICA_MCPCLIENT_MCPCLIENT_CLAMAV_SERVER: "clamavd:3310"
+      ARCHIVEMATICA_MCPCLIENT_MCPCLIENT_CLAMAV_CLIENT_MAX_FILE_SIZE: ${CLAMAV_MAX_FILE_SIZE:-2000M}
+      ARCHIVEMATICA_MCPCLIENT_MCPCLIENT_CLAMAV_CLIENT_MAX_SCAN_SIZE: ${CLAMAV_MAX_SCAN_SIZE:-2000M}
+      ARCHIVEMATICA_MCPCLIENT_MCPCLIENT_CLAMAV_CLIENT_MAX_STREAM_LENGTH: ${CLAMAV_MAX_STREAM_LENGTH:-2000M}
+      ARCHIVEMATICA_MCPCLIENT_MCPCLIENT_CLAMAV_CLIENT_BACKEND: "clamdscanner"
+    volumes:
+      - archivematica_pipeline_data:/var/archivematica/sharedDirectory:rw
+    depends_on:
+      mysql:
+        condition: service_healthy
+      gearmand:
+        condition: service_started
+      elasticsearch:
+        condition: service_healthy
+      clamavd:
+        condition: service_started
+      fits:
+        condition: service_started
+
+  # ===========================================================================
+  # Archivematica Dashboard (Main Web UI)
+  # ===========================================================================
+  archivematica-dashboard:
+    build:
+      context: "./submodules/archivematica/src"
+      dockerfile: "dashboard.Dockerfile"
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      FORWARDED_ALLOW_IPS: "*"
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY}
+      DJANGO_SETTINGS_MODULE: settings.common
+      DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-*}
+      ARCHIVEMATICA_DASHBOARD_DASHBOARD_GEARMAN_SERVER: "gearmand:4730"
+      ARCHIVEMATICA_DASHBOARD_DASHBOARD_ELASTICSEARCH_SERVER: "elasticsearch:9200"
+      ARCHIVEMATICA_DASHBOARD_DASHBOARD_SEARCH_ENABLED: ${AM_SEARCH_ENABLED:-true}
+      ARCHIVEMATICA_DASHBOARD_CLIENT_USER: ${MYSQL_USER:-archivematica}
+      ARCHIVEMATICA_DASHBOARD_CLIENT_PASSWORD: ${MYSQL_PASSWORD}
+      ARCHIVEMATICA_DASHBOARD_CLIENT_HOST: mysql
+      ARCHIVEMATICA_DASHBOARD_CLIENT_DATABASE: MCP
+      AM_GUNICORN_RELOAD: "false"
+      AM_GUNICORN_WORKERS: ${AM_GUNICORN_WORKERS:-4}
+      AM_GUNICORN_TIMEOUT: ${AM_GUNICORN_TIMEOUT:-172800}
+      AM_GUNICORN_BIND: "0.0.0.0:8000"
+    volumes:
+      - archivematica_pipeline_data:/var/archivematica/sharedDirectory:rw
+    depends_on:
+      mysql:
+        condition: service_healthy
+      gearmand:
+        condition: service_started
+      elasticsearch:
+        condition: service_healthy
+
+  # ===========================================================================
+  # Archivematica Storage Service
+  # ===========================================================================
+  archivematica-storage-service:
+    build:
+      context: "./submodules/archivematica-storage-service"
+      dockerfile: "Dockerfile"
+    restart: unless-stopped
+    ports:
+      - "8001:8000"
+    environment:
+      FORWARDED_ALLOW_IPS: "*"
+      DJANGO_SECRET_KEY: ${SS_DJANGO_SECRET_KEY}
+      DJANGO_SETTINGS_MODULE: storage_service.settings.production
+      DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-*}
+      SS_DB_URL: "mysql://${MYSQL_USER:-archivematica}:${MYSQL_PASSWORD}@mysql:3306/SS"
+      SS_GUNICORN_RELOAD: "false"
+      SS_GUNICORN_WORKERS: ${SS_GUNICORN_WORKERS:-4}
+      SS_GUNICORN_TIMEOUT: ${SS_GUNICORN_TIMEOUT:-172800}
+      SS_GUNICORN_BIND: "0.0.0.0:8000"
+    volumes:
+      - archivematica_pipeline_data:/var/archivematica/sharedDirectory:rw
+      - archivematica_storage_service_staging_data:/var/archivematica/storage_service:rw
+      - archivematica_storage_service_location_data:/home:rw
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+volumes:
+  mysql_data:
+  elasticsearch_data:
+  clamav_data:
+  archivematica_pipeline_data:
+  archivematica_storage_service_staging_data:
+  archivematica_storage_service_location_data:
