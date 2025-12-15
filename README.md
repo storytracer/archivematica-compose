@@ -2,13 +2,15 @@
 
 Production-ready Docker Compose configuration for deploying [Archivematica](https://www.archivematica.org/).
 
+Based on the official development environment at [artefactual/archivematica/hack](https://github.com/artefactual/archivematica/tree/qa/1.x/hack).
+
 ## Overview
 
-This repository provides a self-contained Docker Compose setup for Archivematica that:
+This setup:
 
 - Exposes Dashboard on port 8000
 - Exposes Storage Service on port 8001
-- Includes all required services (MySQL, Elasticsearch, ClamAV, etc.)
+- Includes all required services (MySQL, Elasticsearch, ClamAV, Gearman)
 - Uses production-safe defaults
 - No nginx included (bring your own reverse proxy for SSL)
 
@@ -18,8 +20,6 @@ This repository provides a self-contained Docker Compose setup for Archivematica
 - Docker Compose ≥ 2.17
 - At least 8GB RAM (16GB recommended)
 - `vm.max_map_count=262144` set on host (required for Elasticsearch)
-
-To set the Elasticsearch requirement:
 
 ```bash
 sudo sysctl -w vm.max_map_count=262144
@@ -44,24 +44,21 @@ git submodule update --init --recursive
 ### 2. Generate Secure Credentials
 
 ```bash
-# Django secret keys (generate two separate keys)
-python3 -c "import secrets; print(secrets.token_urlsafe(50))"
+# Django secret key
 python3 -c "import secrets; print(secrets.token_urlsafe(50))"
 
-# MySQL passwords (generate two separate passwords)
+# MySQL passwords (generate two)
 openssl rand -base64 32 | tr -d '=+/'
 openssl rand -base64 32 | tr -d '=+/'
 ```
 
 ### 3. Configure Environment
 
-Copy the example environment file and add your generated secrets:
-
 ```bash
 cp env.example .env
 ```
 
-Edit `.env` and replace all `REPLACE_WITH_*` placeholders with your generated values.
+Edit `.env` and replace all `REPLACE_WITH_*` placeholders.
 
 ### 4. Deploy
 
@@ -71,18 +68,24 @@ docker compose up -d --build
 
 ### 5. Initialize Databases
 
-Wait for services to be healthy, then run migrations:
+Wait for services to be healthy:
 
 ```bash
-docker compose exec archivematica-dashboard /src/dashboard/src/manage.py migrate
-docker compose exec archivematica-storage-service /src/storage_service/manage.py migrate
+docker compose ps
+```
+
+Then run migrations:
+
+```bash
+docker compose exec archivematica-dashboard /src/hack/manage.py migrate --settings=archivematica.dashboard.settings.local
+docker compose exec archivematica-storage-service /src/manage.py migrate
 ```
 
 Create admin users:
 
 ```bash
-docker compose exec archivematica-dashboard /src/dashboard/src/manage.py createsuperuser
-docker compose exec archivematica-storage-service /src/storage_service/manage.py createsuperuser
+docker compose exec archivematica-dashboard /src/hack/manage.py createsuperuser --settings=archivematica.dashboard.settings.local
+docker compose exec archivematica-storage-service /src/manage.py createsuperuser
 ```
 
 ### 6. Access
@@ -90,114 +93,52 @@ docker compose exec archivematica-storage-service /src/storage_service/manage.py
 - **Dashboard**: http://your-server:8000
 - **Storage Service**: http://your-server:8001
 
-For production, place a reverse proxy (nginx, Caddy, Traefik) in front to handle SSL.
-
 ## Environment Variables
 
-| Variable | Description | Example |
+| Variable | Description | Default |
 |----------|-------------|---------|
-| `DJANGO_SECRET_KEY` | Dashboard secret key | (generated) |
-| `SS_DJANGO_SECRET_KEY` | Storage Service secret key | (generated) |
-| `MYSQL_ROOT_PASSWORD` | MySQL root password | (generated) |
+| `DJANGO_SECRET_KEY` | Dashboard secret key | (required) |
+| `MYSQL_ROOT_PASSWORD` | MySQL root password | (required) |
 | `MYSQL_USER` | MySQL user | `archivematica` |
-| `MYSQL_PASSWORD` | MySQL user password | (generated) |
-| `DJANGO_ALLOWED_HOSTS` | Allowed hostnames | `*` or `yourdomain.com` |
-| `ES_HEAP_SIZE` | Elasticsearch memory | `1g` |
+| `MYSQL_PASSWORD` | MySQL user password | (required) |
+| `ES_HEAP_SIZE` | Elasticsearch memory | `512m` |
 | `AM_SEARCH_ENABLED` | Enable search | `true` |
-| `CLAMAV_MAX_FILE_SIZE` | Max file size for scanning | `2000M` |
-| `CLAMAV_MAX_SCAN_SIZE` | Max scan size | `2000M` |
-| `CLAMAV_MAX_STREAM_LENGTH` | Max stream length | `2000M` |
+| `CLAMAV_MAX_FILE_SIZE_MB` | Max file size (MB) | `42` |
+| `CLAMAV_MAX_SCAN_SIZE_MB` | Max scan size (MB) | `42` |
+| `CLAMAV_MAX_STREAM_LENGTH_MB` | Max stream (MB) | `100` |
 | `AM_GUNICORN_WORKERS` | Dashboard workers | `4` |
-| `SS_GUNICORN_WORKERS` | Storage Service workers | `4` |
-| `AM_GUNICORN_TIMEOUT` | Request timeout (seconds) | `172800` |
-| `SS_GUNICORN_TIMEOUT` | Request timeout (seconds) | `172800` |
-| `AM_CAPTURE_CLIENT_SCRIPT_OUTPUT` | Capture script output | `true` |
-
-See `env.example` for a complete template.
+| `SS_GUNICORN_WORKERS` | Storage workers | `4` |
+| `AM_GUNICORN_TIMEOUT` | Timeout (seconds) | `172800` |
+| `SS_GUNICORN_TIMEOUT` | Timeout (seconds) | `172800` |
 
 ## Services
 
-| Service | Port | Description |
-|---------|------|-------------|
-| archivematica-dashboard | 8000 | Main web interface |
-| archivematica-storage-service | 8001 | Storage management interface |
-| mysql | 3306 | Database (internal) |
-| elasticsearch | 9200 | Search engine (internal) |
-| gearmand | 4730 | Job queue (internal) |
-| redis | 6379 | Cache (internal) |
-| clamavd | 3310 | Antivirus (internal) |
-| fits | 2113 | File identification (internal) |
-
-## Memory Requirements
-
-| Service | Approximate RAM |
-|---------|-----------------|
-| Elasticsearch | 1GB+ |
-| ClamAV | 500MB |
-| MySQL | 500MB |
-| Dashboard | 150MB |
-| Storage Service | 100MB |
-| MCP Client | 50MB |
-| MCP Server | 50MB |
-| **Total** | **~2.5GB minimum** |
-
-Recommend 8GB+ RAM for production workloads.
+| Service | Description |
+|---------|-------------|
+| archivematica-dashboard | Main web interface (port 8000) |
+| archivematica-storage-service | Storage management (port 8001) |
+| archivematica-mcp-server | Job coordination |
+| archivematica-mcp-client | Job processing |
+| mysql | Database (Percona 8.4) |
+| elasticsearch | Search engine (ES 8.19) |
+| gearmand | Job queue |
+| clamavd | Antivirus scanning |
 
 ## Useful Commands
 
 ```bash
-# View logs
-docker compose logs -f
-
-# View specific service logs
-docker compose logs -f archivematica-dashboard
-
-# Check service status
-docker compose ps
-
-# Restart a service
-docker compose restart archivematica-dashboard
-
-# Stop everything
-docker compose down
-
-# Stop and remove volumes (WARNING: destroys data)
-docker compose down -v
-
-# Rebuild after changes
-docker compose up -d --build
+docker compose logs -f                    # View all logs
+docker compose logs -f archivematica-dashboard  # Dashboard logs
+docker compose ps                         # Service status
+docker compose restart archivematica-dashboard  # Restart service
+docker compose down                       # Stop everything
+docker compose down -v                    # Stop and remove volumes
+docker compose up -d --build              # Rebuild and start
 ```
 
-## Troubleshooting
+## Adding Submodules
 
-### Elasticsearch fails to start
-
-Ensure `vm.max_map_count` is set on the host:
-
-```bash
-sudo sysctl vm.max_map_count=262144
-```
-
-### Services restarting continuously
-
-Check logs:
-
-```bash
-docker compose logs -f archivematica-dashboard
-docker compose logs -f mysql
-```
-
-### Database connection errors
-
-Wait for MySQL health check to pass before running migrations:
-
-```bash
-docker compose ps
-```
-
-## Adding Submodules (for repository setup)
-
-If setting up this repository from scratch:
+If setting up from scratch:
 
 ```bash
 git submodule add -b qa/1.x https://github.com/artefactual/archivematica.git submodules/archivematica
@@ -206,7 +147,7 @@ git submodule add -b qa/0.x https://github.com/artefactual/archivematica-storage
 
 ## License
 
-This deployment configuration is provided as-is. Archivematica is licensed under the [AGPL-3.0](https://www.archivematica.org/en/docs/archivematica-1.18/user-manual/overview/intro/#license).
+Archivematica is licensed under [AGPL-3.0](https://www.archivematica.org/en/docs/archivematica-1.18/user-manual/overview/intro/#license).
 
 ## Links
 
